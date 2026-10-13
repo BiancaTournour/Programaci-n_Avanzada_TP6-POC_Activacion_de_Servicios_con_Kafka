@@ -1,0 +1,198 @@
+# POC Activación de Servicios con Kafka
+# Levantar todo:  docker compose up -d
+# Reset completo: docker compose down -v
+#
+# NOTA: las versiones de las imágenes están fijadas a tags concretos (ver doc, sección 09).
+# Servicios NestJS y UI: imagen única docker/Dockerfile.service (build-arg APP).
+
+name: activation-poc
+
+services:
+  # ---------------------------------------------------------------- Kafka (KRaft, 1 nodo)
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: poc-kafka
+    ports:
+      - "9092:9092" # listener EXTERNAL: para herramientas en tu máquina
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT = red interna de Docker (kafka:29092) · EXTERNAL = host (localhost:9092)
+      KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Un solo broker: todo con factor de replicación 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Los topics se crean solo con kafka-init: un typo en un nombre falla en vez de crear un topic fantasma
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # Crea los topics (3 particiones, retención 7 días) y termina.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    container_name: poc-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+    volumes:
+      - ./docker/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["/bin/bash", "/create-topics.sh"]
+    restart: "no"
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.0.0
+    container_name: poc-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: poc
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "false"
+
+  # ---------------------------------------------------------------- PostgreSQL
+  # Un contenedor, una base de datos por servicio (se crean en docker/postgres/init-databases.sh)
+  postgres:
+    image: postgres:16-alpine
+    container_name: poc-postgres
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poc -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------- Email simulado
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: poc-mailhog
+    ports:
+      - "8025:8025" # bandeja de entrada (web)
+      - "1025:1025" # SMTP
+
+  # ================================================================
+  # Servicios de la aplicación. Todos comparten el mismo Dockerfile (build-arg APP).
+  # billing/provisioning NO publican puerto para poder escalarlos:
+  #   docker compose up -d --scale billing-service=2
+  # ================================================================
+  activation-api:
+    build: &svc-build { context: ., dockerfile: docker/Dockerfile.service, args: { APP: activation-api } }
+    image: poc/activation-api
+    ports:
+      - "3000:3000"
+    depends_on: &svc-deps
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    restart: on-failure
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: activation-api
+      KAFKA_GROUP_ID: activation-api
+      DATABASE_URL: postgres://poc:poc@postgres:5432/activation_db
+      PORT: "3000"
+
+  billing-service:
+    build: { context: ., dockerfile: docker/Dockerfile.service, args: { APP: billing-service } }
+    image: poc/billing-service
+    depends_on: *svc-deps
+    restart: on-failure
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: billing-service
+      KAFKA_GROUP_ID: billing-svc
+      DATABASE_URL: postgres://poc:poc@postgres:5432/billing_db
+
+  provisioning-service:
+    build: { context: ., dockerfile: docker/Dockerfile.service, args: { APP: provisioning-service } }
+    image: poc/provisioning-service
+    depends_on: *svc-deps
+    restart: on-failure
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: provisioning-service
+      KAFKA_GROUP_ID: provisioning-svc
+      DATABASE_URL: postgres://poc:poc@postgres:5432/provisioning_db
+
+  notification-service:
+    build: { context: ., dockerfile: docker/Dockerfile.service, args: { APP: notification-service } }
+    image: poc/notification-service
+    depends_on:
+      <<: *svc-deps
+      mailhog: { condition: service_started }
+    restart: on-failure
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: notification-service
+      KAFKA_GROUP_ID: notification-svc
+      DATABASE_URL: postgres://poc:poc@postgres:5432/notification_db
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+
+  crm-analytics-service:
+    build: { context: ., dockerfile: docker/Dockerfile.service, args: { APP: crm-analytics-service } }
+    image: poc/crm-analytics-service
+    depends_on: *svc-deps
+    restart: on-failure
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: crm-analytics-service
+      KAFKA_GROUP_ID: crm-analytics
+      DATABASE_URL: postgres://poc:poc@postgres:5432/crm_db
+
+  demo-ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+      args:
+        VITE_API_URL: http://localhost:3000
+        VITE_KAFKA_UI_URL: http://localhost:8081
+        VITE_MAILHOG_URL: http://localhost:8025
+    image: poc/demo-ui
+    ports:
+      - "5173:80"
+    depends_on:
+      - activation-api
+
+  # Escenario 5 (no arranca con "up"): docker compose --profile loyalty up -d loyalty-service
+  loyalty-service:
+    profiles: ["loyalty"]
+    build: { context: ., dockerfile: docker/Dockerfile.service, args: { APP: loyalty-service } }
+    image: poc/loyalty-service
+    depends_on: *svc-deps
+    restart: on-failure
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      KAFKA_CLIENT_ID: loyalty-service
+      KAFKA_GROUP_ID: loyalty-svc
+      KAFKA_AUTO_OFFSET_RESET: earliest # lee todo el historial al unirse
+      DATABASE_URL: postgres://poc:poc@postgres:5432/loyalty_db
+
+volumes:
+  kafka-data:
+  postgres-data:

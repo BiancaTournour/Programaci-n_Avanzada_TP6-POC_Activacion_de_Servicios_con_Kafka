@@ -1,0 +1,24 @@
+{
+  "name": "activation-poc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "POC Activación de Servicios con Kafka (NestJS + React + PostgreSQL)",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:libs": "pnpm --filter \"./libs/*\" build",
+    "test:libs": "pnpm --filter \"./libs/*\" test",
+    "typecheck": "pnpm -r typecheck",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:reset": "docker compose down -v",
+    "infra:topics": "docker compose logs kafka-init",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}
